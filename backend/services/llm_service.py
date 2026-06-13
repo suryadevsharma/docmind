@@ -15,11 +15,13 @@ SYSTEM_PROMPT = (
 )
 
 _PREFERRED_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "gemini-2.0-flash",
     "gemini-1.5-flash-latest",
     "gemini-1.5-flash",
     "gemini-1.5-pro-latest",
     "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
 ]
 
 
@@ -40,13 +42,15 @@ def _resolve_model_name() -> str:
         for name, methods in available.items():
             if "generateContent" in methods:
                 return name
-    except Exception:
-        # If listing fails, we still try a common default.
+    except Exception as e:
+        print(f"DocMind backend: list_models failed with error: {e}")
         pass
-    return "gemini-1.5-flash"
+    return "gemini-3.5-flash"
 
 
-_model = genai.GenerativeModel(_resolve_model_name())
+_resolved_name = _resolve_model_name()
+print(f"DocMind backend: resolved Gemini model to '{_resolved_name}'")
+_model = genai.GenerativeModel(_resolved_name)
 
 
 def _extractive_fallback(context_chunks: list[str]) -> str:
@@ -75,8 +79,9 @@ def generate_answer(question: str, context_chunks: list[dict], chat_history: lis
         response = _model.generate_content(prompt)
         return (response.text or "").strip()
     except Exception as exc:
+        print(f"Gemini API error in generate_answer: {exc}")
         msg = str(exc).lower()
-        if "quota" in msg or "429" in msg or "rate limit" in msg:
+        if "quota" in msg or "429" in msg or "rate limit" in msg or "api_key" in msg or "key" in msg or "unauthorized" in msg:
             return _extractive_fallback(raw_texts)
         raise
 
@@ -98,8 +103,9 @@ def generate_answer_stream(question: str, context_chunks: list[dict], chat_histo
             if chunk.text:
                 yield chunk.text
     except Exception as exc:
+        print(f"Gemini API error in generate_answer_stream: {exc}")
         msg = str(exc).lower()
-        if "quota" in msg or "429" in msg or "rate limit" in msg:
+        if "quota" in msg or "429" in msg or "rate limit" in msg or "api_key" in msg or "key" in msg or "unauthorized" in msg:
             fallback_text = _extractive_fallback(raw_texts)
             for word in fallback_text.split(" "):
                 yield word + " "

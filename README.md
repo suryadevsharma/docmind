@@ -14,7 +14,7 @@ Production-ready RAG Document Q&A app for uploading PDF/DOCX files and chatting 
 - Secure document upload with file signature validation (PDF/DOCX) and size limit
 - Parsing and chunking pipeline (500 tokens, 50 overlap)
 - Local embeddings (`all-MiniLM-L6-v2`) + persistent ChromaDB vector search
-- Gemini 1.5 Flash answer generation with retrieval context and chat memory
+- Gemini 2.5/3.5 Flash answer generation with retrieval context and chat memory
 - Session-based document chat history persisted in MySQL
 - Real-time streaming chat completions using Server-Sent Events (SSE) and robust client-side buffering
 - Comprehensive backend integration test suite with fast, mock-driven execution
@@ -47,7 +47,7 @@ Production-ready RAG Document Q&A app for uploading PDF/DOCX files and chatting 
                                                       | context + prompt
                                                       v
                                             +----------------------+
-                                            | Gemini 1.5 Flash    |
+                                            | Gemini 2.5 Flash    |
                                             +----------------------+
 ```
 
@@ -55,11 +55,11 @@ Production-ready RAG Document Q&A app for uploading PDF/DOCX files and chatting 
 
 | Layer | Technology |
 |---|---|
-| Backend | FastAPI, SQLAlchemy, PyMySQL, python-jose, passlib |
+| Backend | FastAPI, SQLAlchemy, PyMySQL, python-jose, bcrypt |
 | Parsing | PyMuPDF, python-docx |
 | Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) |
 | Vector DB | ChromaDB (persistent local storage) |
-| LLM | Google Gemini 1.5 Flash (`google-generativeai`) |
+| LLM | Google Gemini 2.5/3.5 Flash (`google-generativeai`) |
 | Frontend | React 18, Vite, Tailwind CSS, Axios |
 | Deployment | Render (API), Vercel (Web) |
 

@@ -13,7 +13,7 @@ The diagram below represents the complete system topology, data flow, interface 
                                         |                                                                |
                                         |  +--------------------+             +-----------------------+  |
                                         |  | Google Gemini API  |             | Hugging Face Hub      |  |
-                                        |  | (1.5 Flash Model)  |             | (Embedding Weights)   |  |
+                                        |  | (2.5/3.5 Flash)    |             | (Embedding Weights)   |  |
                                         |  +---------+----------+             +-----------+-----------+  |
                                         +------------|------------------------------------|--------------+
                                                      ^ HTTPS (gRPC-backed)                | HTTPS
@@ -63,9 +63,9 @@ The diagram below represents the complete system topology, data flow, interface 
   * *Why chose it over alternatives:* SQLAlchemy allows using raw SQL queries alongside abstract database models. Its connection pooling and dialect abstractions allow us to easily switch between local SQLite development and Render-hosted production MySQL without rewriting query logic.
   * *Exactly where used:* Database connection setup is in [database.py](file:///c:/Users/Asus/OneDrive/Desktop/New%20folder/docmind/backend/database.py), schema models are in [models.py](file:///c:/Users/Asus/OneDrive/Desktop/New%20folder/docmind/backend/models.py), and session queries are distributed across the endpoints.
 
-* **Passlib (with bcrypt) & Python-Jose**
-  * *What it is:* Passlib handles secure password hashing, and Python-Jose generates and verifies JSON Web Tokens (JWT).
-  * *Why chose it over alternatives:* Standard cryptography packages can be complex. `passlib[bcrypt]` offers simple, secure bcrypt hashing with work-factor configuration. `python-jose` handles JWT generation and validation safely using HS256 HMAC algorithms.
+* **Bcrypt & Python-Jose**
+  * *What it is:* Bcrypt handles secure password hashing, and Python-Jose generates and verifies JSON Web Tokens (JWT).
+  * *Why chose it over alternatives:* Standard cryptography packages like Passlib are unmaintained. Direct use of the native `bcrypt` package offers highly secure password hashing without deprecation or library conflicts on modern Python setups. `python-jose` handles JWT generation and validation safely using HS256 HMAC algorithms.
   * *Exactly where used:* Hashing and token validation helpers are located in [auth.py](file:///c:/Users/Asus/OneDrive/Desktop/New%20folder/docmind/backend/auth.py).
 
 ### Parsing & Machine Learning
@@ -91,7 +91,7 @@ The diagram below represents the complete system topology, data flow, interface 
 
 * **Google Generative AI SDK (`google-generativeai`)**
   * *What it is:* The official SDK for interacting with Google's Gemini models.
-  * *Why chose it over alternatives:* We chose Google Gemini 1.5 Flash due to its massive 1M token context window, extremely fast inference speeds, low cost per token, and strong performance in handling multi-turn RAG conversations compared to OpenAI's GPT-3.5 or GPT-4o-mini.
+  * *Why chose it over alternatives:* We use Google Gemini 2.5 Flash / 3.5 Flash. We prioritized `gemini-2.5-flash` due to its extremely low response latency (TTFT under 1.4 seconds), large context window, fast inference, and strong performance in handling multi-turn RAG conversations compared to other models.
   * *Exactly where used:* LLM configurations and prompt generation are structured in [llm_service.py](file:///c:/Users/Asus/OneDrive/Desktop/New%20folder/docmind/backend/services/llm_service.py).
 
 ### Frontend Web App
@@ -264,7 +264,7 @@ When a user asks a question:
 3. ChromaDB calculates cosine similarity against the collection and returns the top 5 matching text chunks along with metadata (page number, source filename).
 
 #### Q24: Which LLM is used and how does it generate answers?
-We use Google Gemini 1.5 Flash via the `google-generativeai` SDK. In [llm_service.py](file:///c:/Users/Asus/OneDrive/Desktop/New%20folder/docmind/backend/services/llm_service.py), the model is configured with a strict system prompt:
+We dynamically resolve the Gemini model, prioritizing `gemini-2.5-flash` for low-latency streaming (TTFT ~1.38s) and falling back to `gemini-3.5-flash`. In [llm_service.py](file:///c:/Users/Asus/OneDrive/Desktop/New%20folder/docmind/backend/services/llm_service.py), the model is configured with a strict system prompt:
 ```text
 You are a helpful document assistant. Answer questions only based on the provided document context. If the answer is not in the context, say 'I could not find this information in the document.' Be concise and accurate.
 ```
@@ -481,7 +481,7 @@ Most tutorials use cloud services (like OpenAI and Pinecone) for their entire pi
 * **20 Messages per Minute:** The rate limit per user for the chat API.
 * **6 Messages:** The lookback limit used to load conversation history for context.
 * **Top 5 Chunks:** The number of retrieved document snippets passed to Gemini for answer generation.
-* **1M Tokens:** The context window size supported by Google Gemini 1.5 Flash.
+* **1M Tokens:** The context window size supported by Google Gemini models.
 
 ---
 
@@ -491,7 +491,7 @@ Most tutorials use cloud services (like OpenAI and Pinecone) for their entire pi
 "Many organizations struggle to search and retrieve information from large volumes of internal documentation, such as PDFs and Word files. Users often spend hours manually reading through pages to find answers, while using generic public AI models can leak sensitive data and lead to incorrect answers."
 
 ### How it Works (3-4 sentences)
-"To solve this, I built DocMind, a secure, document-based QA application. The backend is built with FastAPI, which handles file uploads, validates file signatures, and chunks text. It generates vector embeddings locally using the `all-MiniLM-L6-v2` transformer model and indexes them in a persistent ChromaDB database. When a user asks a question, the system retrieves relevant snippets, formats them as context, and streams the answer using Google Gemini 1.5 Flash alongside verified citations."
+"To solve this, I built DocMind, a secure, document-based QA application. The backend is built with FastAPI, which handles file uploads, validates file signatures, and chunks text. It generates vector embeddings locally using the `all-MiniLM-L6-v2` transformer model and indexes them in a persistent ChromaDB database. When a user asks a question, the system retrieves relevant snippets, formats them as context, and streams the answer using Google Gemini 2.5/3.5 Flash alongside verified citations."
 
 ### Uniqueness (2-3 sentences)
 "What makes DocMind unique is its local-first approach to data processing, which handles embeddings and vector indexing locally to reduce API costs. It also features strict multi-tenant data isolation by creating separate vector collections per user, and includes a fallback retrieval system if LLM limits are exceeded."
