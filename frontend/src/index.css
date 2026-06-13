@@ -4,4 +4,81 @@
 
 body {
   @apply bg-background text-white;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
 }
+
+/* Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(99, 102, 241, 0.25);
+  border-radius: 9999px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(99, 102, 241, 0.45);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-fadeIn {
+  animation: fadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Markdown prose overrides */
+.markdown p {
+  margin-bottom: 0.75rem;
+}
+.markdown p:last-child {
+  margin-bottom: 0;
+}
+.markdown ol, .markdown ul {
+  padding-left: 1.25rem;
+  margin-bottom: 0.75rem;
+  list-style-type: decimal;
+}
+.markdown ul {
+  list-style-type: disc;
+}
+.markdown li {
+  margin-bottom: 0.25rem;
+}
+.markdown pre {
+  background-color: rgba(15, 23, 42, 0.6);
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  font-family: monospace;
+  font-size: 0.875rem;
+  border: 1px solid rgba(51, 65, 85, 0.5);
+  margin-bottom: 0.75rem;
+}
+.markdown code {
+  font-family: monospace;
+  font-size: 0.875rem;
+  background-color: rgba(15, 23, 42, 0.4);
+  padding: 0.125rem 0.25rem;
+  border-radius: 0.25rem;
+}
+.markdown h1, .markdown h2, .markdown h3 {
+  font-weight: 700;
+  margin-top: 1rem;
+  margin-bottom: 0.5rem;
+  color: rgb(165, 180, 252);
+}
+.markdown h1 { font-size: 1.25rem; }
+.markdown h2 { font-size: 1.125rem; }
+.markdown h3 { font-size: 1rem; }

@@ -57,4 +57,7 @@ class Message(Base):
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
+    sources = Column(Text, nullable=True)
+
     session = relationship("ChatSession", back_populates="messages")
+

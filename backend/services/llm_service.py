@@ -60,8 +60,9 @@ def _extractive_fallback(context_chunks: list[str]) -> str:
     )
 
 
-def generate_answer(question: str, context_chunks: list[str], chat_history: list[dict]) -> str:
-    context = "\n\n---\n\n".join(context_chunks) if context_chunks else "No context found."
+def generate_answer(question: str, context_chunks: list[dict], chat_history: list[dict]) -> str:
+    raw_texts = [c["text"] for c in context_chunks] if context_chunks else []
+    context = "\n\n---\n\n".join(raw_texts) if raw_texts else "No context found."
     history_text = "\n".join([f"{m['role']}: {m['content']}" for m in chat_history[-6:]])
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
@@ -76,5 +77,32 @@ def generate_answer(question: str, context_chunks: list[str], chat_history: list
     except Exception as exc:
         msg = str(exc).lower()
         if "quota" in msg or "429" in msg or "rate limit" in msg:
-            return _extractive_fallback(context_chunks)
+            return _extractive_fallback(raw_texts)
         raise
+
+
+def generate_answer_stream(question: str, context_chunks: list[dict], chat_history: list[dict]):
+    raw_texts = [c["text"] for c in context_chunks] if context_chunks else []
+    context = "\n\n---\n\n".join(raw_texts) if raw_texts else "No context found."
+    history_text = "\n".join([f"{m['role']}: {m['content']}" for m in chat_history[-6:]])
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Document Context:\n{context}\n\n"
+        f"Recent Chat History:\n{history_text}\n\n"
+        f"Question:\n{question}\n\n"
+        "Answer:"
+    )
+    try:
+        response = _model.generate_content(prompt, stream=True)
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "quota" in msg or "429" in msg or "rate limit" in msg:
+            fallback_text = _extractive_fallback(raw_texts)
+            for word in fallback_text.split(" "):
+                yield word + " "
+        else:
+            raise
+

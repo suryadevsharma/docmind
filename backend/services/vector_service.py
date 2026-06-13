@@ -14,16 +14,26 @@ def create_collection(collection_id: str):
     return _client.get_or_create_collection(name=collection_id)
 
 
-def add_chunks(collection_id: str, chunks: list[str], embeddings: list[list[float]], chunk_ids: list[str]) -> None:
+def add_chunks(collection_id: str, chunks: list[str], embeddings: list[list[float]], chunk_ids: list[str], metadatas: list[dict] = None) -> None:
     collection = create_collection(collection_id)
-    collection.add(ids=chunk_ids, documents=chunks, embeddings=embeddings)
+    collection.add(ids=chunk_ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
 
 
-def query_similar(collection_id: str, query_embedding: list[float], n_results: int = 5) -> list[str]:
+def query_similar(collection_id: str, query_embedding: list[float], n_results: int = 5) -> list[dict]:
     collection = _client.get_collection(name=collection_id)
     result = collection.query(query_embeddings=[query_embedding], n_results=n_results)
     docs = result.get("documents", [[]])
-    return docs[0] if docs else []
+    metadatas = result.get("metadatas", [[]])
+    
+    output = []
+    if docs and metadatas:
+        for doc, meta in zip(docs[0], metadatas[0]):
+            output.append({
+                "text": doc,
+                "metadata": meta or {}
+            })
+    return output
+
 
 
 def delete_collection(collection_id: str) -> None:

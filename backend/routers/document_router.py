@@ -80,10 +80,13 @@ async def upload_document(
         db.commit()
         db.refresh(doc)
 
-        embeddings = embed_texts(chunks)
+        raw_texts = [c["text"] for c in chunks]
+        metadatas = [{"page": c["page"], "source": file.filename} for c in chunks]
+        embeddings = embed_texts(raw_texts)
         chunk_ids = [f"chunk_{doc.id}_{i}" for i in range(len(chunks))]
         create_collection(collection_id)
-        add_chunks(collection_id, chunks, embeddings, chunk_ids)
+        add_chunks(collection_id, raw_texts, embeddings, chunk_ids, metadatas=metadatas)
+
     except SQLAlchemyError as exc:
         db.rollback()
         if os.path.exists(file_path):

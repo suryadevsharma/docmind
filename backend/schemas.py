@@ -1,7 +1,8 @@
+import json
 from datetime import datetime
 from typing import Any, List, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class ApiResponse(BaseModel):
@@ -74,7 +75,18 @@ class MessageOut(BaseModel):
     session_id: int
     role: str
     content: str
+    sources: Optional[Any] = None
     created_at: datetime
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def parse_sources(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return []
+        return v
 
     class Config:
         from_attributes = True

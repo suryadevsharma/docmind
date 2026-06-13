@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import inspect, text
 
 from database import Base, engine
 from routers.auth_router import router as auth_router
@@ -30,6 +31,14 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    try:
+        inspector = inspect(engine)
+        columns = [col["name"] for col in inspector.get_columns("messages")]
+        if "sources" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE messages ADD COLUMN sources TEXT"))
+    except Exception as e:
+        print(f"Migration error during startup: {e}")
 
 
 @app.exception_handler(HTTPException)

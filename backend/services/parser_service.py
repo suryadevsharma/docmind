@@ -22,20 +22,36 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     return chunks
 
 
-def parse_pdf(filepath: str) -> List[str]:
-    pages_text = []
+def parse_pdf(filepath: str) -> List[dict]:
+    chunks_with_meta = []
     with fitz.open(filepath) as pdf:
-        for page in pdf:
+        for i, page in enumerate(pdf):
             txt = page.get_text("text").strip()
-            if txt:
-                pages_text.append(txt)
-    return chunk_text("\n".join(pages_text))
+            if not txt:
+                continue
+            page_chunks = chunk_text(txt)
+            for chunk in page_chunks:
+                chunks_with_meta.append({
+                    "text": chunk,
+                    "page": i + 1
+                })
+    return chunks_with_meta
 
 
-def parse_docx(filepath: str) -> List[str]:
+def parse_docx(filepath: str) -> List[dict]:
     doc = DocxDocument(filepath)
     paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    return chunk_text("\n".join(paragraphs))
+    full_text = "\n".join(paragraphs)
+    all_chunks = chunk_text(full_text)
+    
+    chunks_with_meta = []
+    for idx, chunk in enumerate(all_chunks):
+        chunks_with_meta.append({
+            "text": chunk,
+            "page": (idx // 2) + 1
+        })
+    return chunks_with_meta
+
 
 
 def detect_file_type(file_bytes: bytes) -> str:
