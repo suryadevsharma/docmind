@@ -100,7 +100,7 @@ def test_document_upload_and_list(mock_add_chunks, mock_create_coll, mock_embed_
         {"text": "Paragraph chunk 1 from page 1", "page": 1},
         {"text": "Paragraph chunk 2 from page 2", "page": 2}
     ]
-    mock_embed_texts.return_value = [[0.1] * 384, [0.2] * 384]
+    mock_embed_texts.return_value = [[0.1] * 3072, [0.2] * 3072]
 
     # Get login credentials
     login_res = client.post("/api/auth/login", json={
@@ -129,7 +129,7 @@ def test_document_upload_and_list(mock_add_chunks, mock_create_coll, mock_embed_
 @patch("routers.chat_router.query_similar")
 @patch("routers.chat_router.generate_answer")
 def test_chat_session_creation_and_messaging(mock_gen_answer, mock_query, mock_embed, client):
-    mock_embed.return_value = [[0.1] * 384]
+    mock_embed.return_value = [[0.1] * 3072]
     mock_query.return_value = [{
         "text": "Paragraph chunk 2 from page 2",
         "metadata": {"page": 2, "source": "manual.pdf"}
@@ -183,7 +183,7 @@ def test_chat_session_creation_and_messaging(mock_gen_answer, mock_query, mock_e
 @patch("routers.chat_router.query_similar")
 @patch("routers.chat_router.generate_answer_stream")
 def test_chat_streaming(mock_gen_stream, mock_query, mock_embed, client):
-    mock_embed.return_value = [[0.1] * 384]
+    mock_embed.return_value = [[0.1] * 3072]
     mock_query.return_value = [{
         "text": "Paragraph chunk 1 from page 1",
         "metadata": {"page": 1, "source": "manual.pdf"}

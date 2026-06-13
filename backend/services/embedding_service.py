@@ -1,10 +1,20 @@
-from sentence_transformers import SentenceTransformer
+import os
+import google.generativeai as genai
 
-_model = SentenceTransformer("all-MiniLM-L6-v2")
+_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+genai.configure(api_key=_api_key)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    vectors = _model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-    return vectors.tolist()
+    try:
+        response = genai.embed_content(
+            model="models/gemini-embedding-001",
+            content=texts,
+            task_type="retrieval_document",
+        )
+        return response.get("embedding", [])
+    except Exception as exc:
+        print(f"Gemini embedding API error: {exc}")
+        return [[0.0] * 3072 for _ in texts]

@@ -2,16 +2,30 @@ import os
 
 import chromadb
 from chromadb.errors import NotFoundError
+from chromadb import EmbeddingFunction
 from dotenv import load_dotenv
 
 load_dotenv()
+
+class NoneEmbeddingFunction(EmbeddingFunction):
+    def __init__(self):
+        pass
+
+    def name(self) -> str:
+        return "none"
+
+    def __call__(self, input):
+        return []
 
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
 _client = chromadb.PersistentClient(path=CHROMA_DIR)
 
 
 def create_collection(collection_id: str):
-    return _client.get_or_create_collection(name=collection_id)
+    return _client.get_or_create_collection(
+        name=collection_id,
+        embedding_function=NoneEmbeddingFunction()
+    )
 
 
 def add_chunks(collection_id: str, chunks: list[str], embeddings: list[list[float]], chunk_ids: list[str], metadatas: list[dict] = None) -> None:
@@ -20,7 +34,10 @@ def add_chunks(collection_id: str, chunks: list[str], embeddings: list[list[floa
 
 
 def query_similar(collection_id: str, query_embedding: list[float], n_results: int = 5) -> list[dict]:
-    collection = _client.get_collection(name=collection_id)
+    collection = _client.get_collection(
+        name=collection_id,
+        embedding_function=NoneEmbeddingFunction()
+    )
     result = collection.query(query_embeddings=[query_embedding], n_results=n_results)
     docs = result.get("documents", [[]])
     metadatas = result.get("metadatas", [[]])
