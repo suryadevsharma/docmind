@@ -16,6 +16,8 @@ Production-ready RAG Document Q&A app for uploading PDF/DOCX files and chatting 
 - Local embeddings (`all-MiniLM-L6-v2`) + persistent ChromaDB vector search
 - Gemini 1.5 Flash answer generation with retrieval context and chat memory
 - Session-based document chat history persisted in MySQL
+- Real-time streaming chat completions using Server-Sent Events (SSE) and robust client-side buffering
+- Comprehensive backend integration test suite with fast, mock-driven execution
 - Responsive dark-themed React UI with upload modal, document cards, and source snippets
 - Basic rate limiting for chat endpoint (20 messages/minute/user)
 - Standard API response contract: `{ success, data, message }`
@@ -80,6 +82,15 @@ Production-ready RAG Document Q&A app for uploading PDF/DOCX files and chatting 
    - `copy .env.example .env`
    - `npm run dev`
 4. Open app at `http://localhost:5173`
+
+### Running Tests
+
+We have a fast, mock-driven backend integration test suite that tests authentication, document upload, standard chat, and streaming chat endpoints without requiring network calls or loading heavy model files:
+
+1. Enter backend folder: `cd backend`
+2. Run pytest using the virtual environment:
+   * Windows: `..\.venv\Scripts\python -m pytest test_backend.py`
+   * Unix/macOS: `../.venv/bin/python -m pytest test_backend.py`
 
 ## API Documentation
 
@@ -150,7 +161,7 @@ All responses follow:
 
 - Background job queue for large document processing
 - Token-aware chunking and metadata-enriched retrieval
-- Streaming answers and typing indicators
+- Typing indicators for streaming transitions
 - Role-based access and organization-level document sharing
-- Automated tests (unit + integration + e2e)
+- Frontend end-to-end (e2e) tests using Cypress or Playwright
 - Redis-backed distributed rate limiting
