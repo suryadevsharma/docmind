@@ -1,7 +1,7 @@
 from typing import List
 import zipfile
 
-import fitz
+import pymupdf
 from docx import Document as DocxDocument
 
 
@@ -24,7 +24,7 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
 
 def parse_pdf(filepath: str) -> List[dict]:
     chunks_with_meta = []
-    with fitz.open(filepath) as pdf:
+    with pymupdf.open(filepath) as pdf:
         for i, page in enumerate(pdf):
             txt = page.get_text("text").strip()
             if not txt:
