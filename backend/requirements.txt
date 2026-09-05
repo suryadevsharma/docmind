@@ -11,3 +11,4 @@ chromadb
 google-generativeai
 python-dotenv
 pydantic[email]
+psycopg2-binary
