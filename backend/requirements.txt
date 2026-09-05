@@ -8,7 +8,7 @@ python-multipart
 pymupdf
 python-docx
 chromadb
-google-generativeai
+google-genai
 python-dotenv
 pydantic[email]
 psycopg2-binary

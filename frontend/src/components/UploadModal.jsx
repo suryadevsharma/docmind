@@ -7,7 +7,10 @@ export default function UploadModal({ open, onClose, onUploaded }) {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
   const inputRef = useRef(null);
+  // Synchronous guard to prevent double-click upload race conditions
+  const isUploadingRef = useRef(false);
 
   if (!open) return null;
 
@@ -18,7 +21,9 @@ export default function UploadModal({ open, onClose, onUploaded }) {
   };
 
   const upload = async () => {
-    if (!file) return;
+    if (!file || isUploadingRef.current) return;
+    isUploadingRef.current = true;
+    setIsUploading(true);
     setError("");
     setSuccess("");
     try {
@@ -44,6 +49,9 @@ export default function UploadModal({ open, onClose, onUploaded }) {
     } catch (e) {
       setError(e?.response?.data?.message || e.message || "Document upload failed");
       setProgress(0);
+    } finally {
+      isUploadingRef.current = false;
+      setIsUploading(false);
     }
   };
 
@@ -140,7 +148,7 @@ export default function UploadModal({ open, onClose, onUploaded }) {
           </button>
           <button
             onClick={upload}
-            disabled={!file || progress > 0}
+            disabled={!file || isUploading || progress > 0}
             className="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-indigo-600/15 hover:bg-indigo-500 hover:shadow-indigo-500/25 transition duration-300 disabled:cursor-not-allowed disabled:opacity-40 outline-none"
           >
             Start Upload

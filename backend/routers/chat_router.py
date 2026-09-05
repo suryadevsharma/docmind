@@ -3,7 +3,7 @@ import logging
 import time
 from collections import defaultdict, deque
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -12,16 +12,20 @@ from database import get_db
 from models import ChatSession, Document, Message, User
 from schemas import ChatMessageCreate, ChatSessionCreate, ChatSessionOut, MessageOut
 from services.embedding_service import embed_texts
-from services.llm_service import generate_answer, generate_answer_stream
+from services.llm_service import GeminiRateLimitError, generate_answer, generate_answer_stream
 from services.vector_service import DocumentUnavailableError, query_similar
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
+# --- Rate limiting (preserved from original) ---
 _rate_limiter = defaultdict(deque)
 MAX_PER_MINUTE = 20
 WINDOW_SECONDS = 60
+
+# --- In-flight generation lock: prevents duplicate concurrent requests per session ---
+_active_generating_sessions: set = set()
 
 
 def resp(success: bool, data, message: str):
@@ -82,20 +86,42 @@ async def send_message(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    history_rows = (
-        db.query(Message)
-        .filter(Message.session_id == payload.session_id)
-        .order_by(Message.created_at.desc())
-        .limit(6)
-        .all()
-    )
-    history_rows.reverse()
-    history = [{"role": h.role, "content": h.content} for h in history_rows]
+    # Prevent concurrent generation on same session
+    if session.id in _active_generating_sessions:
+        raise HTTPException(
+            status_code=409,
+            detail="A response is already being generated for this chat session. Please wait.",
+        )
+
+    _active_generating_sessions.add(session.id)
+    t_total = time.time()
 
     try:
-        question_vec = embed_texts([question], task_type="retrieval_query")[0]
+        history_rows = (
+            db.query(Message)
+            .filter(Message.session_id == payload.session_id)
+            .order_by(Message.created_at.desc())
+            .limit(6)
+            .all()
+        )
+        history_rows.reverse()
+        history = [{"role": h.role, "content": h.content} for h in history_rows]
+
+        # Step 1: Embed the query (single embedding call)
+        t0 = time.time()
+        question_vec = embed_texts([question], task_type="RETRIEVAL_QUERY")[0]
+        embed_ms = (time.time() - t0) * 1000
+
+        # Step 2: Retrieve similar chunks from ChromaDB
+        t0 = time.time()
         chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5, doc=doc)
+        retrieval_ms = (time.time() - t0) * 1000
+
+        # Step 3: Generate answer (single LLM call)
+        t0 = time.time()
         answer = generate_answer(question, chunks, history)
+        generation_ms = (time.time() - t0) * 1000
+
     except DocumentUnavailableError as unavail_err:
         logger.warning(f"Document unavailable for doc {doc.id}: {unavail_err}")
         return resp(
@@ -106,12 +132,24 @@ async def send_message(
             },
             "Document unavailable",
         )
+    except GeminiRateLimitError as rate_err:
+        logger.warning(f"[CHAT] Gemini rate limit for user {current_user.id}: {rate_err}")
+        return resp(
+            True,
+            {
+                "answer": str(rate_err),
+                "sources": [],
+            },
+            "Rate limited",
+        )
     except Exception as exc:
         logger.error(f"Error generating answer in send_message: {exc}", exc_info=True)
         raise HTTPException(
             status_code=502,
             detail="Failed to generate response from AI provider. Please try again shortly.",
         ) from exc
+    finally:
+        _active_generating_sessions.discard(session.id)
 
     sources = []
     for c in chunks:
@@ -121,6 +159,8 @@ async def send_message(
             "source": c["metadata"].get("source", "Unknown")
         })
 
+    # Step 4: Save to database (single write)
+    t0 = time.time()
     try:
         user_msg = Message(session_id=session.id, role="user", content=question)
         ai_msg = Message(session_id=session.id, role="assistant", content=answer, sources=json.dumps(sources))
@@ -131,6 +171,14 @@ async def send_message(
         logger.error(f"Database error saving message in send_message: {db_exc}", exc_info=True)
         db.rollback()
         raise
+    db_ms = (time.time() - t0) * 1000
+
+    total_ms = (time.time() - t_total) * 1000
+    logger.info(
+        f"[CHAT] session_id={session.id} user_id={current_user.id} "
+        f"embedding={embed_ms:.0f}ms retrieval={retrieval_ms:.0f}ms "
+        f"generation={generation_ms:.0f}ms db_save={db_ms:.0f}ms total={total_ms:.0f}ms"
+    )
 
     return resp(True, {"answer": answer, "sources": sources}, "Message processed")
 
@@ -162,6 +210,7 @@ async def get_sessions(document_id: int, db: Session = Depends(get_db), current_
 
 @router.post("/message/stream")
 async def send_message_stream(
+    request: Request,
     payload: ChatMessageCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -183,26 +232,29 @@ async def send_message_stream(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    history_rows = (
-        db.query(Message)
-        .filter(Message.session_id == payload.session_id)
-        .order_by(Message.created_at.desc())
-        .limit(6)
-        .all()
-    )
-    history_rows.reverse()
-    history = [{"role": h.role, "content": h.content} for h in history_rows]
+    # Prevent concurrent generation on same session
+    if session.id in _active_generating_sessions:
+        raise HTTPException(
+            status_code=409,
+            detail="A response is already being generated for this chat session. Please wait.",
+        )
 
+    # Pre-generation steps: embed query + retrieve chunks (before entering SSE generator)
     try:
-        question_vec = embed_texts([question], task_type="retrieval_query")[0]
+        t_embed = time.time()
+        question_vec = embed_texts([question], task_type="RETRIEVAL_QUERY")[0]
+        embed_ms = (time.time() - t_embed) * 1000
+
+        t_retrieval = time.time()
         chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5, doc=doc)
+        retrieval_ms = (time.time() - t_retrieval) * 1000
     except DocumentUnavailableError as unavail_err:
         logger.warning(f"Document unavailable for doc {doc.id}: {unavail_err}")
         async def unavailable_stream_generator():
             yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
             msg = "The uploaded document file is no longer available on the server (it may have been cleared during a server restart). Please upload the document again to continue chatting."
             yield f"data: {json.dumps({'type': 'content', 'content': msg})}\n\n"
-            yield "data: {\"type\": \"done\"}\n\n"
+            yield 'data: {"type": "done"}\n\n'
         return StreamingResponse(unavailable_stream_generator(), media_type="text/event-stream")
     except Exception as exc:
         logger.error(f"Failed to query document references for doc {doc.id}: {exc}", exc_info=True)
@@ -219,33 +271,79 @@ async def send_message_stream(
             "source": c["metadata"].get("source", "Unknown")
         })
 
+    history_rows = (
+        db.query(Message)
+        .filter(Message.session_id == payload.session_id)
+        .order_by(Message.created_at.desc())
+        .limit(6)
+        .all()
+    )
+    history_rows.reverse()
+    history = [{"role": h.role, "content": h.content} for h in history_rows]
+
     async def event_generator():
-        # Yield citations first
-        yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
-        
-        full_answer = ""
-        try:
-            for chunk in generate_answer_stream(question, chunks, history):
-                full_answer += chunk
-                yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
-        except Exception as e:
-            logger.error(f"Gemini streaming error: {e}", exc_info=True)
-            # Yield error token
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-            return
+        # Register active generation
+        _active_generating_sessions.add(session.id)
+        t_total = time.time()
 
-        # Save to database
         try:
-            user_msg = Message(session_id=session.id, role="user", content=question)
-            ai_msg = Message(session_id=session.id, role="assistant", content=full_answer, sources=json.dumps(sources))
-            db.add(user_msg)
-            db.add(ai_msg)
-            db.commit()
-        except Exception as db_exc:
-            logger.error(f"Database error saving streaming messages: {db_exc}", exc_info=True)
-            db.rollback()
+            # Yield citations first
+            yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
 
-        yield "data: {\"type\": \"done\"}\n\n"
+            full_answer = ""
+            generation_success = False
+            t_gen = time.time()
+
+            try:
+                for chunk in generate_answer_stream(question, chunks, history):
+                    # Check if client disconnected — stop generating
+                    if await request.is_disconnected():
+                        logger.info(f"[CHAT-STREAM] Client disconnected session_id={session.id}")
+                        return
+
+                    full_answer += chunk
+                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+
+                generation_success = True
+
+            except GeminiRateLimitError as rate_err:
+                logger.warning(f"[CHAT-STREAM] Gemini rate limit session_id={session.id}: {rate_err}")
+                yield f"data: {json.dumps({'type': 'error', 'message': str(rate_err)})}\n\n"
+                return
+            except Exception as e:
+                logger.error(f"[CHAT-STREAM] Gemini streaming error session_id={session.id}: {e}", exc_info=True)
+                yield f"data: {json.dumps({'type': 'error', 'message': 'An error occurred during generation. Please try again.'})}\n\n"
+                return
+
+            gen_ms = (time.time() - t_gen) * 1000
+
+            # Save to database only on successful generation
+            if generation_success and full_answer.strip():
+                t_db = time.time()
+                try:
+                    user_msg = Message(session_id=session.id, role="user", content=question)
+                    ai_msg = Message(session_id=session.id, role="assistant", content=full_answer, sources=json.dumps(sources))
+                    db.add(user_msg)
+                    db.add(ai_msg)
+                    db.commit()
+                except Exception as db_exc:
+                    logger.error(f"Database error saving streaming messages: {db_exc}", exc_info=True)
+                    db.rollback()
+                db_ms = (time.time() - t_db) * 1000
+            else:
+                db_ms = 0
+
+            total_ms = (time.time() - t_total) * 1000
+            logger.info(
+                f"[CHAT-STREAM] session_id={session.id} user_id={current_user.id} "
+                f"embedding={embed_ms:.0f}ms retrieval={retrieval_ms:.0f}ms "
+                f"generation={gen_ms:.0f}ms db_save={db_ms:.0f}ms total={total_ms:.0f}ms"
+            )
+
+            yield 'data: {"type": "done"}\n\n'
+
+        finally:
+            _active_generating_sessions.discard(session.id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -266,4 +364,3 @@ async def delete_session(
     db.delete(session)
     db.commit()
     return resp(True, None, "Session deleted successfully")
-

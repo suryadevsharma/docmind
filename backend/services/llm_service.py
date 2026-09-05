@@ -1,22 +1,18 @@
 import logging
 import os
+import random
 import time
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 from dotenv import load_dotenv
-import google.generativeai as genai
-try:
-    from google.api_core import exceptions
-except Exception:
-    exceptions = None
+from google import genai
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 _api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-if _api_key:
-    genai.configure(api_key=_api_key)
+_client = genai.Client(api_key=_api_key) if _api_key else None
 
 SYSTEM_PROMPT = (
     "You are a helpful document assistant. Answer questions only based on the provided "
@@ -24,35 +20,62 @@ SYSTEM_PROMPT = (
     "'I could not find this information in the document.' Be concise and accurate."
 )
 
-PRIMARY_MODEL = "gemini-2.5-flash"
-FALLBACK_MODELS = ["gemini-flash-latest"]
-MAX_500_RETRIES = 2
-INITIAL_BACKOFF = 0.3
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-_cached_models: Dict[str, genai.GenerativeModel] = {}
-
-
-def _get_model(model_name: str) -> genai.GenerativeModel:
-    if model_name not in _cached_models:
-        _cached_models[model_name] = genai.GenerativeModel(model_name)
-    return _cached_models[model_name]
-
-
-def _is_transient_error(exc: Exception) -> bool:
-    if exceptions and isinstance(exc, (exceptions.InternalServerError, exceptions.ServiceUnavailable)):
-        return True
-    msg = str(exc).lower()
-    return any(k in msg for k in ["500", "503", "internal error", "service unavailable", "deadline exceeded", "timeout"])
+# Retry configuration — bounded and conservative
+MAX_RETRIES = 1          # At most 1 retry for transient errors
+INITIAL_BACKOFF = 1.0    # Base backoff in seconds
+MAX_BACKOFF = 4.0        # Cap backoff
 
 
 def _is_quota_error(exc: Exception) -> bool:
-    if exceptions and isinstance(exc, exceptions.ResourceExhausted):
-        return True
+    """Detect HTTP 429 / ResourceExhausted / rate-limit errors."""
     msg = str(exc).lower()
-    return any(k in msg for k in ["429", "quota", "resourceexhausted", "rate limit"])
+    return any(k in msg for k in ["429", "quota", "resourceexhausted", "rate limit", "rate_limit", "resource_exhausted"])
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Detect transient 500/503/timeout errors that may succeed on retry."""
+    msg = str(exc).lower()
+    return any(k in msg for k in ["500", "503", "internal", "service unavailable", "deadline exceeded", "timeout", "unavailable"])
+
+
+def _extract_retry_delay(exc: Exception) -> float | None:
+    """Attempt to extract Google's recommended retry delay from error metadata."""
+    try:
+        # google.genai errors may carry retry_delay in their details
+        if hasattr(exc, "details") and exc.details:
+            for detail in exc.details:
+                if hasattr(detail, "retry_delay"):
+                    rd = detail.retry_delay
+                    if hasattr(rd, "total_seconds"):
+                        return rd.total_seconds()
+                    return float(rd)
+        # Check string representation as fallback
+        msg = str(exc)
+        if "retry_delay" in msg:
+            # Very basic extraction — not critical if it fails
+            import re
+            match = re.search(r"retry_delay.*?(\d+\.?\d*)\s*s", msg)
+            if match:
+                return float(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _backoff_with_jitter(attempt: int) -> float:
+    """Calculate exponential backoff with jitter."""
+    base = min(INITIAL_BACKOFF * (2 ** attempt), MAX_BACKOFF)
+    return base * (0.5 + random.random() * 0.5)  # jitter between 50%-100% of base
 
 
 def _build_prompt(question: str, context_chunks: List[dict], chat_history: List[dict]) -> Tuple[str, List[str]]:
+    """Build the LLM prompt from question, context chunks, and chat history.
+
+    Returns:
+        Tuple of (prompt_string, list_of_unique_chunk_texts).
+    """
     # Deduplicate chunks while preserving order
     seen = set()
     unique_texts = []
@@ -75,6 +98,7 @@ def _build_prompt(question: str, context_chunks: List[dict], chat_history: List[
 
 
 def _extractive_fallback(context_chunks: List[str]) -> str:
+    """Return a best-effort extractive answer when Gemini is unavailable."""
     if not context_chunks:
         return "I could not find this information in the document."
     snippet = context_chunks[0][:500].strip()
@@ -85,115 +109,193 @@ def _extractive_fallback(context_chunks: List[str]) -> str:
     )
 
 
+class GeminiRateLimitError(Exception):
+    """Raised when Gemini quota is exhausted and the request should not be retried."""
+    pass
+
+
 def generate_answer(question: str, context_chunks: List[dict], chat_history: List[dict]) -> str:
+    """Generate a non-streaming answer using the primary Gemini model.
+
+    Raises GeminiRateLimitError if quota is exhausted.
+    """
+    if not _client:
+        logger.error("Gemini API key not configured")
+        return _extractive_fallback([])
+
     prompt, raw_texts = _build_prompt(question, context_chunks, chat_history)
-    candidate_models = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m != PRIMARY_MODEL]
     last_exc = None
 
-    for model_name in candidate_models:
-        model = _get_model(model_name)
-        attempt = 0
-        while attempt <= MAX_500_RETRIES:
-            try:
-                response = model.generate_content(prompt)
-                ans = (response.text or "").strip()
-                if ans:
-                    return ans
-                break
-            except Exception as exc:
-                last_exc = exc
-                if _is_quota_error(exc):
-                    logger.warning(f"Quota limit hit on model '{model_name}'. Trying next available model...")
-                    break
-                if _is_transient_error(exc) and attempt < MAX_500_RETRIES:
-                    delay = INITIAL_BACKOFF * (2 ** attempt)
-                    logger.warning(
-                        f"Temporary error ({exc.__class__.__name__}) on '{model_name}', "
-                        f"retrying {attempt+1}/{MAX_500_RETRIES} in {delay:.2f}s..."
-                    )
-                    time.sleep(delay)
-                    attempt += 1
-                    continue
-                logger.error(f"Gemini API error on '{model_name}': {exc}", exc_info=True)
-                break
+    for attempt in range(MAX_RETRIES + 1):
+        t0 = time.time()
+        try:
+            response = _client.models.generate_content(
+                model=PRIMARY_MODEL,
+                contents=prompt,
+            )
+            elapsed_ms = (time.time() - t0) * 1000
+            ans = (response.text or "").strip()
 
-    logger.error(f"All Gemini models exhausted in generate_answer: {last_exc}", exc_info=True)
+            logger.info(
+                f"[LLM] model={PRIMARY_MODEL} attempt={attempt} "
+                f"duration={elapsed_ms:.0f}ms success=true"
+            )
+
+            if ans:
+                return ans
+
+            # Empty response — don't retry, just use extractive fallback
+            logger.warning(f"[LLM] Empty response from {PRIMARY_MODEL}")
+            return _extractive_fallback(raw_texts)
+
+        except Exception as exc:
+            elapsed_ms = (time.time() - t0) * 1000
+            last_exc = exc
+
+            if _is_quota_error(exc):
+                retry_delay = _extract_retry_delay(exc)
+                logger.warning(
+                    f"[LLM] 429 quota hit model={PRIMARY_MODEL} attempt={attempt} "
+                    f"duration={elapsed_ms:.0f}ms retry_delay={retry_delay}"
+                )
+
+                # If retry delay is short and we haven't retried yet, wait and retry once
+                if attempt < MAX_RETRIES and retry_delay and retry_delay <= 5.0:
+                    jittered = retry_delay + random.random() * 0.5
+                    logger.info(f"[LLM] Waiting {jittered:.1f}s before retry (Google retry_delay={retry_delay}s)")
+                    time.sleep(jittered)
+                    continue
+
+                # Quota exhausted — fail fast, do NOT cascade to other models
+                raise GeminiRateLimitError(
+                    "Gemini is temporarily rate-limited. Please try again in a moment."
+                ) from exc
+
+            if _is_transient_error(exc) and attempt < MAX_RETRIES:
+                delay = _backoff_with_jitter(attempt)
+                logger.warning(
+                    f"[LLM] Transient error model={PRIMARY_MODEL} attempt={attempt} "
+                    f"duration={elapsed_ms:.0f}ms error={exc.__class__.__name__} "
+                    f"retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+                continue
+
+            # Non-retryable error
+            logger.error(
+                f"[LLM] ERROR model={PRIMARY_MODEL} attempt={attempt} "
+                f"duration={elapsed_ms:.0f}ms error={exc.__class__.__name__}: {exc}",
+                exc_info=True,
+            )
+            break
+
+    logger.error(f"[LLM] All retries exhausted: {last_exc}", exc_info=True)
     return _extractive_fallback(raw_texts)
 
 
 def generate_answer_stream(question: str, context_chunks: List[dict], chat_history: List[dict]):
+    """Generate a streaming answer using the primary Gemini model.
+
+    Yields text chunks as they arrive from the model.
+    Raises GeminiRateLimitError if quota is exhausted before any tokens are yielded.
+    """
+    if not _client:
+        logger.error("Gemini API key not configured")
+        yield _extractive_fallback([])
+        return
+
     prompt, raw_texts = _build_prompt(question, context_chunks, chat_history)
-    candidate_models = [PRIMARY_MODEL] + [m for m in FALLBACK_MODELS if m != PRIMARY_MODEL]
     last_exc = None
 
-    for model_name in candidate_models:
-        model = _get_model(model_name)
-        attempt = 0
-        while attempt <= MAX_500_RETRIES:
-            yielded_any = False
-            try:
-                response = model.generate_content(prompt, stream=True)
-                for chunk in response:
-                    text = ""
-                    try:
-                        text = chunk.text
-                    except Exception:
-                        if hasattr(chunk, "candidates") and chunk.candidates:
-                            c = chunk.candidates[0]
-                            if hasattr(c, "content") and hasattr(c.content, "parts"):
-                                text = "".join(
-                                    getattr(p, "text", "") for p in c.content.parts if hasattr(p, "text")
-                                )
-                    if text:
-                        yielded_any = True
-                        yield text
+    for attempt in range(MAX_RETRIES + 1):
+        t0 = time.time()
+        yielded_any = False
+        try:
+            response = _client.models.generate_content_stream(
+                model=PRIMARY_MODEL,
+                contents=prompt,
+            )
+            ttft_logged = False
+            for chunk in response:
+                text = ""
+                try:
+                    text = chunk.text
+                except Exception:
+                    # Fallback extraction from candidates
+                    if hasattr(chunk, "candidates") and chunk.candidates:
+                        c = chunk.candidates[0]
+                        if hasattr(c, "content") and hasattr(c.content, "parts"):
+                            text = "".join(
+                                getattr(p, "text", "") for p in c.content.parts if hasattr(p, "text")
+                            )
+                if text:
+                    if not ttft_logged:
+                        ttft_ms = (time.time() - t0) * 1000
+                        logger.info(f"[LLM-STREAM] model={PRIMARY_MODEL} ttft={ttft_ms:.0f}ms")
+                        ttft_logged = True
+                    yielded_any = True
+                    yield text
 
-                if yielded_any:
-                    return
+            if yielded_any:
+                total_ms = (time.time() - t0) * 1000
+                logger.info(
+                    f"[LLM-STREAM] model={PRIMARY_MODEL} attempt={attempt} "
+                    f"duration={total_ms:.0f}ms success=true"
+                )
+                return
 
-                # If stream returned 0 chunks, attempt non-streaming fallback before giving up
-                logger.warning(f"Stream yielded empty response on '{model_name}'. Trying non-streaming fallback...")
-                non_stream_resp = model.generate_content(prompt)
-                fallback_ans = (non_stream_resp.text or "").strip()
-                if fallback_ans:
-                    yield fallback_ans
-                    return
-                break
-            except Exception as exc:
-                last_exc = exc
-                if yielded_any:
-                    logger.error(f"Gemini stream interrupted after partial output on '{model_name}': {exc}", exc_info=True)
-                    return
+            # Stream completed but yielded nothing — use extractive fallback
+            logger.warning(f"[LLM-STREAM] Empty stream from {PRIMARY_MODEL}")
+            yield _extractive_fallback(raw_texts)
+            return
 
-                if _is_quota_error(exc):
-                    logger.warning(f"Quota limit hit on '{model_name}'. Trying next available model...")
-                    break
+        except Exception as exc:
+            elapsed_ms = (time.time() - t0) * 1000
+            last_exc = exc
 
-                if _is_transient_error(exc) and attempt < MAX_500_RETRIES:
-                    delay = INITIAL_BACKOFF * (2 ** attempt)
-                    logger.warning(
-                        f"Temporary error ({exc.__class__.__name__}) on '{model_name}', "
-                        f"retrying {attempt+1}/{MAX_500_RETRIES} in {delay:.2f}s..."
-                    )
-                    time.sleep(delay)
-                    attempt += 1
+            # If we already yielded partial content, don't retry — just stop
+            if yielded_any:
+                logger.error(
+                    f"[LLM-STREAM] Interrupted after partial output model={PRIMARY_MODEL} "
+                    f"duration={elapsed_ms:.0f}ms error={exc.__class__.__name__}: {exc}",
+                    exc_info=True,
+                )
+                return
+
+            if _is_quota_error(exc):
+                retry_delay = _extract_retry_delay(exc)
+                logger.warning(
+                    f"[LLM-STREAM] 429 quota hit model={PRIMARY_MODEL} attempt={attempt} "
+                    f"duration={elapsed_ms:.0f}ms retry_delay={retry_delay}"
+                )
+
+                if attempt < MAX_RETRIES and retry_delay and retry_delay <= 5.0:
+                    jittered = retry_delay + random.random() * 0.5
+                    logger.info(f"[LLM-STREAM] Waiting {jittered:.1f}s before retry")
+                    time.sleep(jittered)
                     continue
 
-                # Non-streaming fallback if streaming fails before any output
-                try:
-                    logger.info(f"Attempting non-streaming fallback for '{model_name}'...")
-                    non_stream_resp = model.generate_content(prompt)
-                    ans = (non_stream_resp.text or "").strip()
-                    if ans:
-                        yield ans
-                        return
-                except Exception as ns_exc:
-                    logger.warning(f"Non-streaming fallback failed on '{model_name}': {ns_exc}")
+                raise GeminiRateLimitError(
+                    "Gemini is temporarily rate-limited. Please try again in a moment."
+                ) from exc
 
-                logger.error(f"Gemini streaming error on '{model_name}': {exc}", exc_info=True)
-                break
+            if _is_transient_error(exc) and attempt < MAX_RETRIES:
+                delay = _backoff_with_jitter(attempt)
+                logger.warning(
+                    f"[LLM-STREAM] Transient error model={PRIMARY_MODEL} attempt={attempt} "
+                    f"duration={elapsed_ms:.0f}ms retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+                continue
 
-    logger.error(f"All Gemini models exhausted on streaming: {last_exc}", exc_info=True)
+            logger.error(
+                f"[LLM-STREAM] ERROR model={PRIMARY_MODEL} attempt={attempt} "
+                f"duration={elapsed_ms:.0f}ms error={exc.__class__.__name__}: {exc}",
+                exc_info=True,
+            )
+            break
+
+    logger.error(f"[LLM-STREAM] All retries exhausted: {last_exc}", exc_info=True)
     fallback_text = _extractive_fallback(raw_texts)
     for word in fallback_text.split(" "):
         yield word + " "

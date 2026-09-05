@@ -1,54 +1,71 @@
 import logging
 import os
+import time
 from typing import List
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 _api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-if _api_key:
-    genai.configure(api_key=_api_key)
+_client = genai.Client(api_key=_api_key) if _api_key else None
+
+EMBEDDING_MODEL = "gemini-embedding-001"
 
 
-def _ensure_api_key():
-    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-    if key:
-        genai.configure(api_key=key)
-    return key
+def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List[List[float]]:
+    """Generate embeddings for a list of texts using Gemini Embedding API.
 
+    Args:
+        texts: List of text strings to embed.
+        task_type: One of RETRIEVAL_DOCUMENT, RETRIEVAL_QUERY, etc.
 
-def embed_texts(texts: List[str], task_type: str = "retrieval_document") -> List[List[float]]:
+    Returns:
+        List of embedding vectors (each a list of floats).
+    """
     if not texts:
         return []
 
-    _ensure_api_key()
+    if not _client:
+        logger.error("Gemini API key not configured for embeddings")
+        return [[0.0] * 3072 for _ in texts]
+
     all_embeddings: List[List[float]] = []
     batch_size = 50
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
+        t0 = time.time()
         try:
-            response = genai.embed_content(
-                model="models/gemini-embedding-001",
-                content=batch,
-                task_type=task_type,
+            response = _client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=batch,
+                config={"task_type": task_type},
             )
-            emb = response.get("embedding", [])
-            # Handle potential 1D list for single-element batch
-            if emb and isinstance(emb[0], (int, float)):
-                all_embeddings.append(emb)
-            elif emb and isinstance(emb[0], list):
-                all_embeddings.extend(emb)
+            elapsed_ms = (time.time() - t0) * 1000
+
+            if response.embeddings:
+                for emb in response.embeddings:
+                    all_embeddings.append(emb.values)
+                logger.info(
+                    f"[EMBED] batch={i}-{i+len(batch)} count={len(batch)} "
+                    f"model={EMBEDDING_MODEL} duration={elapsed_ms:.0f}ms"
+                )
             else:
-                logger.warning(f"Unexpected embedding response format for batch {i}: {type(emb)}")
+                logger.warning(
+                    f"[EMBED] Empty response for batch {i}-{i+len(batch)}, "
+                    f"using zero vectors"
+                )
                 all_embeddings.extend([[0.0] * 3072 for _ in batch])
+
         except Exception as exc:
+            elapsed_ms = (time.time() - t0) * 1000
             logger.error(
-                f"Gemini embedding API error on batch range [{i}:{i+len(batch)}]: {exc}",
+                f"[EMBED] ERROR batch={i}-{i+len(batch)} "
+                f"duration={elapsed_ms:.0f}ms error={exc.__class__.__name__}: {exc}",
                 exc_info=True,
             )
             all_embeddings.extend([[0.0] * 3072 for _ in batch])

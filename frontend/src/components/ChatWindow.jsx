@@ -9,6 +9,11 @@ export default function ChatWindow({ sessionId }) {
   const [error, setError] = useState("");
   const endRef = useRef(null);
 
+  // Synchronous guard to prevent duplicate submissions (survives React async state updates)
+  const isSubmittingRef = useRef(false);
+  // AbortController ref to cancel in-flight requests on unmount or new send
+  const abortControllerRef = useRef(null);
+
   const fetchHistory = async () => {
     try {
       const res = await api.get(`/api/chat/history/${sessionId}`);
@@ -22,6 +27,15 @@ export default function ChatWindow({ sessionId }) {
   useEffect(() => {
     if (!sessionId) return;
     fetchHistory();
+
+    // Cleanup: abort any in-flight generation when session changes or component unmounts
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+      isSubmittingRef.current = false;
+    };
   }, [sessionId]);
 
   useEffect(() => {
@@ -29,7 +43,10 @@ export default function ChatWindow({ sessionId }) {
   }, [messages, loading]);
 
   const send = async () => {
-    if (!input.trim() || !sessionId || loading) return;
+    // Synchronous ref check — prevents double-click race conditions
+    if (!input.trim() || !sessionId || loading || isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+
     const text = input.trim();
     setInput("");
     setLoading(true);
@@ -45,6 +62,10 @@ export default function ChatWindow({ sessionId }) {
     const placeholderAiMsg = { id: aiMsgId, role: "assistant", content: "", sources: [] };
     setMessages((prev) => [...prev, placeholderAiMsg]);
 
+    // Create an AbortController for this request
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       const token = localStorage.getItem("token");
       const baseUrl = api.defaults.baseURL || "";
@@ -54,7 +75,8 @@ export default function ChatWindow({ sessionId }) {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}`
         },
-        body: JSON.stringify({ session_id: sessionId, message: text })
+        body: JSON.stringify({ session_id: sessionId, message: text }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -99,6 +121,10 @@ export default function ChatWindow({ sessionId }) {
                     );
                   } else if (data.type === "error") {
                     setError(data.message || "An error occurred during generation");
+                    // Remove empty placeholder on error
+                    setMessages((prev) =>
+                      prev.filter((msg) => msg.id !== aiMsgId || msg.content.length > 0)
+                    );
                   }
                 } catch (e) {
                   // Ignore parsing errors
@@ -109,11 +135,15 @@ export default function ChatWindow({ sessionId }) {
         }
       }
     } catch (e) {
+      // Ignore abort errors (user navigated away or sent a new message)
+      if (e.name === "AbortError") return;
       setError(e.message || "Failed to get response");
       // Clean up empty placeholder if it failed completely
       setMessages((prev) => prev.filter((msg) => msg.id !== aiMsgId || msg.content.length > 0));
     } finally {
       setLoading(false);
+      isSubmittingRef.current = false;
+      abortControllerRef.current = null;
     }
   };
 
@@ -156,13 +186,18 @@ export default function ChatWindow({ sessionId }) {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && send()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
             placeholder="Ask a question about this document..."
             className="flex-1 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-2.5 text-sm text-white outline-none transition duration-300 placeholder:text-slate-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
           />
           <button
             onClick={send}
-            disabled={loading}
+            disabled={loading || !input.trim()}
             className="flex items-center justify-center rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-indigo-600/25 transition duration-300 hover:bg-indigo-500 hover:shadow-indigo-500/35 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
           >
             Send

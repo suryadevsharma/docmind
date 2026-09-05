@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -88,18 +89,19 @@ def query_similar(
     original_name: Optional[str] = None,
     doc_id: Optional[Any] = None,
 ) -> list[dict]:
+    """Query ChromaDB for similar chunks using a pre-computed query embedding.
+
+    IMPORTANT: This function does NOT re-embed or re-index documents.
+    If the collection is missing, it raises DocumentUnavailableError so the user
+    can re-upload. This prevents chat queries from triggering expensive bulk
+    embedding operations.
+    """
     # Resolve document metadata if a doc object was passed
     if doc is not None:
-        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-        doc_filename = getattr(doc, "filename", None)
-        if doc_filename and not filepath:
-            filepath = os.path.join(upload_dir, doc_filename)
-        file_type = file_type or getattr(doc, "file_type", None)
         original_name = original_name or getattr(doc, "original_name", "document")
-        doc_id = doc_id or getattr(doc, "id", None)
 
+    t0 = time.time()
     collection = None
-    needs_recovery = False
 
     try:
         collection = _client.get_collection(
@@ -108,40 +110,17 @@ def query_similar(
         )
     except (NotFoundError, ValueError) as not_found_exc:
         logger.warning(
-            f"Chroma collection '{collection_id}' does not exist: {not_found_exc}. Checking for document recovery...",
-            exc_info=True,
+            f"Chroma collection '{collection_id}' does not exist: {not_found_exc}.",
         )
-        needs_recovery = True
+        raise DocumentUnavailableError(
+            f"Document '{original_name or 'file'}' is no longer available on the server. "
+            "Please upload it again to continue chatting."
+        ) from not_found_exc
     except Exception as exc:
         logger.error(f"Unexpected error getting Chroma collection '{collection_id}': {exc}", exc_info=True)
-        needs_recovery = True
-
-    # Robust recovery logic
-    if needs_recovery:
-        if filepath and os.path.exists(filepath):
-            try:
-                collection = reindex_document_file(
-                    collection_id=collection_id,
-                    filepath=filepath,
-                    file_type=file_type or "pdf",
-                    original_name=original_name or "document",
-                    doc_id=doc_id,
-                )
-            except Exception as reindex_exc:
-                logger.error(
-                    f"Failed during auto-reindexing for collection '{collection_id}': {reindex_exc}",
-                    exc_info=True,
-                )
-                raise DocumentUnavailableError(
-                    f"Document '{original_name or 'file'}' could not be recovered. Please upload it again."
-                ) from reindex_exc
-        else:
-            logger.warning(
-                f"Chroma collection '{collection_id}' missing and document file '{filepath}' is unavailable on disk."
-            )
-            raise DocumentUnavailableError(
-                f"Document '{original_name or 'file'}' is no longer available on the server. Please upload it again."
-            )
+        raise DocumentUnavailableError(
+            f"Document '{original_name or 'file'}' could not be accessed. Please upload it again."
+        ) from exc
 
     try:
         result = collection.query(query_embeddings=[query_embedding], n_results=n_results)
@@ -155,6 +134,12 @@ def query_similar(
                     "text": doc_text,
                     "metadata": meta or {},
                 })
+
+        elapsed_ms = (time.time() - t0) * 1000
+        logger.info(
+            f"[RETRIEVAL] collection={collection_id} n_results={n_results} "
+            f"returned={len(output)} duration={elapsed_ms:.0f}ms"
+        )
         return output
     except Exception as q_exc:
         logger.error(f"Error performing vector similarity search in '{collection_id}': {q_exc}", exc_info=True)

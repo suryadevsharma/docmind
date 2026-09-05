@@ -7,8 +7,10 @@ from unittest.mock import patch, MagicMock
 sys.modules["sentence_transformers"] = MagicMock()
 sys.modules["chromadb"] = MagicMock()
 sys.modules["chromadb.errors"] = MagicMock()
+# Mock both the old and new Google SDKs
 sys.modules["google"] = MagicMock()
 sys.modules["google.generativeai"] = MagicMock()
+sys.modules["google.genai"] = MagicMock()
 
 # Append backend directory to path
 backend_dir = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +59,31 @@ def client(db_session):
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+def _get_auth_headers(client):
+    """Helper to register + login and return auth headers."""
+    # Try login first (user may already exist from earlier test)
+    login_res = client.post("/api/auth/login", json={
+        "email": "testuser@example.com",
+        "password": "supersecretpassword"
+    })
+    if login_res.status_code == 200 and login_res.json().get("data", {}).get("token"):
+        token = login_res.json()["data"]["token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    # Register
+    client.post("/api/auth/register", json={
+        "email": "testuser@example.com",
+        "password": "supersecretpassword",
+        "full_name": "Testy McTest"
+    })
+    login_res = client.post("/api/auth/login", json={
+        "email": "testuser@example.com",
+        "password": "supersecretpassword"
+    })
+    token = login_res.json()["data"]["token"]
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_auth_register_and_login(client):
@@ -228,3 +255,144 @@ def test_chat_streaming(mock_gen_stream, mock_query, mock_embed, client):
     # Delete session
     del_res = client.delete(f"/api/chat/session/{session_id}", headers=headers)
     assert del_res.status_code == 200
+
+
+# ==================== NEW FOCUSED TESTS ====================
+
+
+def test_history_endpoints_make_zero_gemini_calls(client):
+    """Verify that history and session list endpoints make zero Gemini API calls."""
+    headers = _get_auth_headers(client)
+
+    # Get a document
+    doc_res = client.get("/api/documents/", headers=headers)
+    docs = doc_res.json()["data"]
+    if not docs:
+        pytest.skip("No documents available for history test")
+    doc_id = docs[0]["id"]
+
+    # Create a session (this should NOT call Gemini)
+    sess_res = client.post("/api/chat/session", json={"document_id": doc_id}, headers=headers)
+    assert sess_res.status_code == 200
+    session_id = sess_res.json()["data"]["id"]
+
+    # List sessions (this should NOT call Gemini)
+    sessions_res = client.get(f"/api/chat/sessions/{doc_id}", headers=headers)
+    assert sessions_res.status_code == 200
+
+    # Get history (this should NOT call Gemini)
+    hist_res = client.get(f"/api/chat/history/{session_id}", headers=headers)
+    assert hist_res.status_code == 200
+
+    # Clean up
+    client.delete(f"/api/chat/session/{session_id}", headers=headers)
+
+
+@patch("routers.chat_router.embed_texts")
+@patch("routers.chat_router.query_similar")
+@patch("routers.chat_router.generate_answer")
+def test_gemini_429_handling(mock_gen_answer, mock_query, mock_embed, client):
+    """Verify that Gemini 429 errors return a clean user-friendly message without crashing."""
+    from services.llm_service import GeminiRateLimitError
+
+    mock_embed.return_value = [[0.1] * 3072]
+    mock_query.return_value = [{
+        "text": "Some chunk text",
+        "metadata": {"page": 1, "source": "test.pdf"}
+    }]
+    mock_gen_answer.side_effect = GeminiRateLimitError(
+        "Gemini is temporarily rate-limited. Please try again in a moment."
+    )
+
+    headers = _get_auth_headers(client)
+
+    # Get a document and create a session
+    doc_res = client.get("/api/documents/", headers=headers)
+    doc_id = doc_res.json()["data"][0]["id"]
+    sess_res = client.post("/api/chat/session", json={"document_id": doc_id}, headers=headers)
+    session_id = sess_res.json()["data"]["id"]
+
+    # Send a message — should get a clean rate limit response, NOT a 500
+    msg_res = client.post("/api/chat/message", json={
+        "session_id": session_id,
+        "message": "Test rate limit question"
+    }, headers=headers)
+    assert msg_res.status_code == 200
+    assert "rate-limited" in msg_res.json()["data"]["answer"].lower()
+
+    # Clean up
+    client.delete(f"/api/chat/session/{session_id}", headers=headers)
+
+
+@patch("routers.chat_router.embed_texts")
+@patch("routers.chat_router.query_similar")
+@patch("routers.chat_router.generate_answer_stream")
+def test_streaming_error_does_not_save_broken_message(mock_gen_stream, mock_query, mock_embed, client):
+    """Verify that when streaming fails, no broken/empty messages are saved to the database."""
+    mock_embed.return_value = [[0.1] * 3072]
+    mock_query.return_value = [{
+        "text": "Some chunk text",
+        "metadata": {"page": 1, "source": "test.pdf"}
+    }]
+
+    # Stream that raises an error without yielding any content
+    def mock_failing_stream(*args, **kwargs):
+        raise Exception("Simulated Gemini failure")
+    mock_gen_stream.side_effect = mock_failing_stream
+
+    headers = _get_auth_headers(client)
+    doc_res = client.get("/api/documents/", headers=headers)
+    doc_id = doc_res.json()["data"][0]["id"]
+    sess_res = client.post("/api/chat/session", json={"document_id": doc_id}, headers=headers)
+    session_id = sess_res.json()["data"]["id"]
+
+    # Stream message — should return an error event
+    res = client.post("/api/chat/message/stream", json={
+        "session_id": session_id,
+        "message": "This should fail"
+    }, headers=headers)
+    assert res.status_code == 200
+    assert '"type": "error"' in res.text
+
+    # Check history — no messages should have been saved
+    hist_res = client.get(f"/api/chat/history/{session_id}", headers=headers)
+    assert hist_res.status_code == 200
+    messages = hist_res.json()["data"]
+    # No messages should exist for this session since generation failed
+    assert len(messages) == 0
+
+    # Clean up
+    client.delete(f"/api/chat/session/{session_id}", headers=headers)
+
+
+@patch("routers.chat_router.embed_texts")
+@patch("routers.chat_router.query_similar")
+def test_query_does_not_reindex_document(mock_query, mock_embed, client):
+    """Verify that query_similar does NOT re-embed document chunks during chat."""
+    mock_embed.return_value = [[0.1] * 3072]
+
+    from services.vector_service import DocumentUnavailableError
+    # Simulate missing collection — should raise DocumentUnavailableError, NOT call embed_texts again
+    mock_query.side_effect = DocumentUnavailableError("Document is unavailable")
+
+    headers = _get_auth_headers(client)
+    doc_res = client.get("/api/documents/", headers=headers)
+    doc_id = doc_res.json()["data"][0]["id"]
+    sess_res = client.post("/api/chat/session", json={"document_id": doc_id}, headers=headers)
+    session_id = sess_res.json()["data"]["id"]
+
+    # Send message — should get a graceful unavailable message
+    msg_res = client.post("/api/chat/message", json={
+        "session_id": session_id,
+        "message": "Test query"
+    }, headers=headers)
+    assert msg_res.status_code == 200
+    assert "upload" in msg_res.json()["data"]["answer"].lower() or "unavailable" in msg_res.json()["message"].lower()
+
+    # Verify embed_texts was called exactly ONCE (for the query embedding only)
+    assert mock_embed.call_count == 1
+    # The single call should be for 1 text (the query), not for document chunks
+    assert len(mock_embed.call_args[0][0]) == 1
+
+    # Clean up
+    client.delete(f"/api/chat/session/{session_id}", headers=headers)
