@@ -78,16 +78,18 @@ async def send_message(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    doc = db.query(Document).filter(Document.id == session.document_id).first()
+    doc = session.document
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
     history_rows = (
         db.query(Message)
         .filter(Message.session_id == payload.session_id)
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.desc())
+        .limit(6)
         .all()
     )
+    history_rows.reverse()
     history = [{"role": h.role, "content": h.content} for h in history_rows]
 
     try:
@@ -177,16 +179,18 @@ async def send_message_stream(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    doc = db.query(Document).filter(Document.id == session.document_id).first()
+    doc = session.document
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
     history_rows = (
         db.query(Message)
         .filter(Message.session_id == payload.session_id)
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.desc())
+        .limit(6)
         .all()
     )
+    history_rows.reverse()
     history = [{"role": h.role, "content": h.content} for h in history_rows]
 
     try:

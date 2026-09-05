@@ -106,10 +106,6 @@ def query_similar(
             name=collection_id,
             embedding_function=NoneEmbeddingFunction(),
         )
-        # If collection exists but is completely empty, it may need recovery if file is available
-        if collection.count() == 0 and filepath and os.path.exists(filepath):
-            logger.info(f"Collection '{collection_id}' is empty. Triggering re-index from file.")
-            needs_recovery = True
     except (NotFoundError, ValueError) as not_found_exc:
         logger.warning(
             f"Chroma collection '{collection_id}' does not exist: {not_found_exc}. Checking for document recovery...",
