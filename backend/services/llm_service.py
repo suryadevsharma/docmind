@@ -19,13 +19,10 @@ SYSTEM_PROMPT = (
 )
 
 _PREFERRED_MODELS = [
-    "gemini-2.5-flash",
     "gemini-3.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro-latest",
-    "gemini-2.0-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
 ]
 
 
@@ -79,15 +76,28 @@ def generate_answer(question: str, context_chunks: list[dict], chat_history: lis
         f"Question:\n{question}\n\n"
         "Answer:"
     )
-    try:
-        response = _model.generate_content(prompt)
-        return (response.text or "").strip()
-    except Exception as exc:
-        logger.error(f"Gemini API error in generate_answer: {exc}", exc_info=True)
-        msg = str(exc).lower()
-        if "quota" in msg or "429" in msg or "rate limit" in msg or "api_key" in msg or "key" in msg or "unauthorized" in msg:
-            return _extractive_fallback(raw_texts)
-        raise
+
+    models_to_try = [_resolved_name] + [m for m in _PREFERRED_MODELS if m != _resolved_name]
+    last_exc = None
+
+    for model_name in models_to_try:
+        try:
+            m_instance = genai.GenerativeModel(model_name)
+            response = m_instance.generate_content(prompt)
+            return (response.text or "").strip()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if "quota" in msg or "429" in msg or "rate limit" in msg or "resourceexhausted" in msg:
+                logger.warning(f"Quota limit hit on model '{model_name}'. Trying next available model...")
+                continue
+            logger.error(f"Gemini API error on '{model_name}': {exc}", exc_info=True)
+            if "api_key" in msg or "key" in msg or "unauthorized" in msg:
+                return _extractive_fallback(raw_texts)
+            raise
+
+    logger.error(f"All Gemini models exhausted on quota: {last_exc}", exc_info=True)
+    return _extractive_fallback(raw_texts)
 
 
 def generate_answer_stream(question: str, context_chunks: list[dict], chat_history: list[dict]):
@@ -101,18 +111,37 @@ def generate_answer_stream(question: str, context_chunks: list[dict], chat_histo
         f"Question:\n{question}\n\n"
         "Answer:"
     )
-    try:
-        response = _model.generate_content(prompt, stream=True)
-        for chunk in response:
-            if chunk.text:
-                yield chunk.text
-    except Exception as exc:
-        logger.error(f"Gemini API error in generate_answer_stream: {exc}", exc_info=True)
-        msg = str(exc).lower()
-        if "quota" in msg or "429" in msg or "rate limit" in msg or "api_key" in msg or "key" in msg or "unauthorized" in msg:
-            fallback_text = _extractive_fallback(raw_texts)
-            for word in fallback_text.split(" "):
-                yield word + " "
-        else:
+
+    models_to_try = [_resolved_name] + [m for m in _PREFERRED_MODELS if m != _resolved_name]
+    last_exc = None
+
+    for model_name in models_to_try:
+        try:
+            m_instance = genai.GenerativeModel(model_name)
+            response = m_instance.generate_content(prompt, stream=True)
+            yielded_any = False
+            for chunk in response:
+                if chunk.text:
+                    yielded_any = True
+                    yield chunk.text
+            if yielded_any:
+                return
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if "quota" in msg or "429" in msg or "rate limit" in msg or "resourceexhausted" in msg:
+                logger.warning(f"Quota limit hit during streaming on model '{model_name}'. Trying next model...")
+                continue
+            logger.error(f"Gemini API streaming error on '{model_name}': {exc}", exc_info=True)
+            if "api_key" in msg or "key" in msg or "unauthorized" in msg:
+                fallback_text = _extractive_fallback(raw_texts)
+                for word in fallback_text.split(" "):
+                    yield word + " "
+                return
             raise
+
+    logger.error(f"All Gemini models exhausted on streaming: {last_exc}", exc_info=True)
+    fallback_text = _extractive_fallback(raw_texts)
+    for word in fallback_text.split(" "):
+        yield word + " "
 
