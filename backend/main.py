@@ -1,6 +1,9 @@
 import os
 
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,8 +14,6 @@ from database import Base, engine
 from routers.auth_router import router as auth_router
 from routers.chat_router import router as chat_router
 from routers.document_router import router as document_router
-
-load_dotenv()
 
 app = FastAPI(title="DocMind API", version="1.0.0")
 

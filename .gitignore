@@ -1,5 +1,7 @@
 backend/uploads/
 backend/chroma_db/
+uploads/
+chroma_db/
 backend/.env
 frontend/.env
 **/__pycache__/

@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from collections import defaultdict, deque
 
@@ -12,7 +13,9 @@ from models import ChatSession, Document, Message, User
 from schemas import ChatMessageCreate, ChatSessionCreate, ChatSessionOut, MessageOut
 from services.embedding_service import embed_texts
 from services.llm_service import generate_answer, generate_answer_stream
-from services.vector_service import query_similar
+from services.vector_service import DocumentUnavailableError, query_similar
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -88,10 +91,21 @@ async def send_message(
     history = [{"role": h.role, "content": h.content} for h in history_rows]
 
     try:
-        question_vec = embed_texts([question])[0]
-        chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5)
+        question_vec = embed_texts([question], task_type="retrieval_query")[0]
+        chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5, doc=doc)
         answer = generate_answer(question, chunks, history)
+    except DocumentUnavailableError as unavail_err:
+        logger.warning(f"Document unavailable for doc {doc.id}: {unavail_err}")
+        return resp(
+            True,
+            {
+                "answer": "The uploaded document file is no longer available on the server (it may have been cleared during a server restart). Please upload the document again to continue chatting.",
+                "sources": [],
+            },
+            "Document unavailable",
+        )
     except Exception as exc:
+        logger.error(f"Error generating answer in send_message: {exc}", exc_info=True)
         raise HTTPException(
             status_code=502,
             detail="Failed to generate response from AI provider. Please try again shortly.",
@@ -105,11 +119,16 @@ async def send_message(
             "source": c["metadata"].get("source", "Unknown")
         })
 
-    user_msg = Message(session_id=session.id, role="user", content=question)
-    ai_msg = Message(session_id=session.id, role="assistant", content=answer, sources=json.dumps(sources))
-    db.add(user_msg)
-    db.add(ai_msg)
-    db.commit()
+    try:
+        user_msg = Message(session_id=session.id, role="user", content=question)
+        ai_msg = Message(session_id=session.id, role="assistant", content=answer, sources=json.dumps(sources))
+        db.add(user_msg)
+        db.add(ai_msg)
+        db.commit()
+    except Exception as db_exc:
+        logger.error(f"Database error saving message in send_message: {db_exc}", exc_info=True)
+        db.rollback()
+        raise
 
     return resp(True, {"answer": answer, "sources": sources}, "Message processed")
 
@@ -171,9 +190,18 @@ async def send_message_stream(
     history = [{"role": h.role, "content": h.content} for h in history_rows]
 
     try:
-        question_vec = embed_texts([question])[0]
-        chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5)
+        question_vec = embed_texts([question], task_type="retrieval_query")[0]
+        chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5, doc=doc)
+    except DocumentUnavailableError as unavail_err:
+        logger.warning(f"Document unavailable for doc {doc.id}: {unavail_err}")
+        async def unavailable_stream_generator():
+            yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
+            msg = "The uploaded document file is no longer available on the server (it may have been cleared during a server restart). Please upload the document again to continue chatting."
+            yield f"data: {json.dumps({'type': 'content', 'content': msg})}\n\n"
+            yield "data: {\"type\": \"done\"}\n\n"
+        return StreamingResponse(unavailable_stream_generator(), media_type="text/event-stream")
     except Exception as exc:
+        logger.error(f"Failed to query document references for doc {doc.id}: {exc}", exc_info=True)
         raise HTTPException(
             status_code=502,
             detail="Failed to query document references. Please try again shortly.",
@@ -197,16 +225,21 @@ async def send_message_stream(
                 full_answer += chunk
                 yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
         except Exception as e:
+            logger.error(f"Gemini streaming error: {e}", exc_info=True)
             # Yield error token
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             return
 
         # Save to database
-        user_msg = Message(session_id=session.id, role="user", content=question)
-        ai_msg = Message(session_id=session.id, role="assistant", content=full_answer, sources=json.dumps(sources))
-        db.add(user_msg)
-        db.add(ai_msg)
-        db.commit()
+        try:
+            user_msg = Message(session_id=session.id, role="user", content=question)
+            ai_msg = Message(session_id=session.id, role="assistant", content=full_answer, sources=json.dumps(sources))
+            db.add(user_msg)
+            db.add(ai_msg)
+            db.commit()
+        except Exception as db_exc:
+            logger.error(f"Database error saving streaming messages: {db_exc}", exc_info=True)
+            db.rollback()
 
         yield "data: {\"type\": \"done\"}\n\n"
 

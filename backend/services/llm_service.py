@@ -1,3 +1,4 @@
+import logging
 import os
 
 from dotenv import load_dotenv
@@ -5,8 +6,11 @@ import google.generativeai as genai
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 _api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
-genai.configure(api_key=_api_key)
+if _api_key:
+    genai.configure(api_key=_api_key)
 
 SYSTEM_PROMPT = (
     "You are a helpful document assistant. Answer questions only based on the provided "
@@ -43,7 +47,7 @@ def _resolve_model_name() -> str:
             if "generateContent" in methods:
                 return name
     except Exception as e:
-        print(f"DocMind backend: list_models failed with error: {e}")
+        logger.error(f"DocMind backend: list_models failed with error: {e}", exc_info=True)
         pass
     return "gemini-3.5-flash"
 
@@ -79,7 +83,7 @@ def generate_answer(question: str, context_chunks: list[dict], chat_history: lis
         response = _model.generate_content(prompt)
         return (response.text or "").strip()
     except Exception as exc:
-        print(f"Gemini API error in generate_answer: {exc}")
+        logger.error(f"Gemini API error in generate_answer: {exc}", exc_info=True)
         msg = str(exc).lower()
         if "quota" in msg or "429" in msg or "rate limit" in msg or "api_key" in msg or "key" in msg or "unauthorized" in msg:
             return _extractive_fallback(raw_texts)
@@ -103,7 +107,7 @@ def generate_answer_stream(question: str, context_chunks: list[dict], chat_histo
             if chunk.text:
                 yield chunk.text
     except Exception as exc:
-        print(f"Gemini API error in generate_answer_stream: {exc}")
+        logger.error(f"Gemini API error in generate_answer_stream: {exc}", exc_info=True)
         msg = str(exc).lower()
         if "quota" in msg or "429" in msg or "rate limit" in msg or "api_key" in msg or "key" in msg or "unauthorized" in msg:
             fallback_text = _extractive_fallback(raw_texts)
