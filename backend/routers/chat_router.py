@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -20,6 +21,14 @@ from services.vector_service import DocumentUnavailableError, query_similar
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+# SSE headers to prevent reverse proxies (Render, Nginx, Vercel, Cloudflare) from buffering chunks
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "Content-Type": "text/event-stream",
+    "X-Accel-Buffering": "no",
+}
 
 # --- Rate limiting (preserved from original) ---
 _rate_limiter = defaultdict(deque)
@@ -269,6 +278,7 @@ async def send_message_stream(
                         return
                     chunk = word + (" " if i < len(words) - 1 else "")
                     yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    await asyncio.sleep(0.02)
 
                 t_db = time.time()
                 try:
@@ -292,7 +302,11 @@ async def send_message_stream(
             finally:
                 _active_generating_sessions.discard(session.id)
 
-        return StreamingResponse(chitchat_stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            chitchat_stream_generator(),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
 
     # Pre-generation steps: embed query + retrieve chunks (before entering SSE generator)
     try:
@@ -310,7 +324,11 @@ async def send_message_stream(
             msg = "The uploaded document file is no longer available on the server (it may have been cleared during a server restart). Please upload the document again to continue chatting."
             yield f"data: {json.dumps({'type': 'content', 'content': msg})}\n\n"
             yield 'data: {"type": "done"}\n\n'
-        return StreamingResponse(unavailable_stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            unavailable_stream_generator(),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
     except Exception as exc:
         logger.error(f"Failed to query document references for doc {doc.id}: {exc}", exc_info=True)
         raise HTTPException(
@@ -344,6 +362,7 @@ async def send_message_stream(
         try:
             # Yield citations first
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+            await asyncio.sleep(0)
 
             full_answer = ""
             generation_success = False
@@ -358,6 +377,7 @@ async def send_message_stream(
 
                     full_answer += chunk
                     yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+                    await asyncio.sleep(0)
 
                 generation_success = True
 
@@ -400,7 +420,11 @@ async def send_message_stream(
         finally:
             _active_generating_sessions.discard(session.id)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @router.delete("/session/{session_id}")
