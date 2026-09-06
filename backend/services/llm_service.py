@@ -7,6 +7,8 @@ from typing import List, Tuple
 from dotenv import load_dotenv
 from google import genai
 
+from services.metrics import metrics
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -20,7 +22,7 @@ SYSTEM_PROMPT = (
     "'I could not find this information in the document.' Be concise and accurate."
 )
 
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 # Retry configuration — bounded and conservative
 MAX_RETRIES = 1          # At most 1 retry for transient errors
@@ -129,6 +131,7 @@ def generate_answer(question: str, context_chunks: List[dict], chat_history: Lis
     for attempt in range(MAX_RETRIES + 1):
         t0 = time.time()
         try:
+            metrics.inc_generation_call(stream=False)
             response = _client.models.generate_content(
                 model=PRIMARY_MODEL,
                 contents=prompt,
@@ -153,6 +156,7 @@ def generate_answer(question: str, context_chunks: List[dict], chat_history: Lis
             last_exc = exc
 
             if _is_quota_error(exc):
+                metrics.inc_429_response("generation")
                 retry_delay = _extract_retry_delay(exc)
                 logger.warning(
                     f"[LLM] 429 quota hit model={PRIMARY_MODEL} attempt={attempt} "
@@ -211,6 +215,7 @@ def generate_answer_stream(question: str, context_chunks: List[dict], chat_histo
         t0 = time.time()
         yielded_any = False
         try:
+            metrics.inc_generation_call(stream=True)
             response = _client.models.generate_content_stream(
                 model=PRIMARY_MODEL,
                 contents=prompt,
@@ -263,6 +268,7 @@ def generate_answer_stream(question: str, context_chunks: List[dict], chat_histo
                 return
 
             if _is_quota_error(exc):
+                metrics.inc_429_response("generation_stream")
                 retry_delay = _extract_retry_delay(exc)
                 logger.warning(
                     f"[LLM-STREAM] 429 quota hit model={PRIMARY_MODEL} attempt={attempt} "

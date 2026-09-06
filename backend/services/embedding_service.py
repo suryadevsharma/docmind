@@ -6,6 +6,8 @@ from typing import List
 from dotenv import load_dotenv
 from google import genai
 
+from services.metrics import metrics
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List
         batch = texts[i : i + batch_size]
         t0 = time.time()
         try:
+            metrics.inc_embedding_call()
             response = _client.models.embed_content(
                 model=EMBEDDING_MODEL,
                 contents=batch,
@@ -63,6 +66,9 @@ def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List
 
         except Exception as exc:
             elapsed_ms = (time.time() - t0) * 1000
+            msg = str(exc).lower()
+            if any(k in msg for k in ["429", "quota", "resourceexhausted", "rate limit", "rate_limit"]):
+                metrics.inc_429_response("embedding")
             logger.error(
                 f"[EMBED] ERROR batch={i}-{i+len(batch)} "
                 f"duration={elapsed_ms:.0f}ms error={exc.__class__.__name__}: {exc}",

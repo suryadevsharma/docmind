@@ -12,7 +12,9 @@ from database import get_db
 from models import ChatSession, Document, Message, User
 from schemas import ChatMessageCreate, ChatSessionCreate, ChatSessionOut, MessageOut
 from services.embedding_service import embed_texts
+from services.intent_service import get_chitchat_response
 from services.llm_service import GeminiRateLimitError, generate_answer, generate_answer_stream
+from services.metrics import metrics
 from services.vector_service import DocumentUnavailableError, query_similar
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,7 @@ def enforce_rate_limit(user_id: int):
     while q and now - q[0] > WINDOW_SECONDS:
         q.popleft()
     if len(q) >= MAX_PER_MINUTE:
+        metrics.inc_429_response("local_rate_limit")
         raise HTTPException(status_code=429, detail="Rate limit exceeded: max 20 messages per minute")
     q.append(now)
 
@@ -107,20 +110,29 @@ async def send_message(
         history_rows.reverse()
         history = [{"role": h.role, "content": h.content} for h in history_rows]
 
-        # Step 1: Embed the query (single embedding call)
-        t0 = time.time()
-        question_vec = embed_texts([question], task_type="RETRIEVAL_QUERY")[0]
-        embed_ms = (time.time() - t0) * 1000
+        chitchat = get_chitchat_response(question)
+        if chitchat:
+            logger.info(f"[CHAT] session_id={session.id} intent=chitchat")
+            answer = chitchat
+            chunks = []
+            embed_ms = 0
+            retrieval_ms = 0
+            generation_ms = 0
+        else:
+            # Step 1: Embed the query (single embedding call)
+            t0 = time.time()
+            question_vec = embed_texts([question], task_type="RETRIEVAL_QUERY")[0]
+            embed_ms = (time.time() - t0) * 1000
 
-        # Step 2: Retrieve similar chunks from ChromaDB
-        t0 = time.time()
-        chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5, doc=doc)
-        retrieval_ms = (time.time() - t0) * 1000
+            # Step 2: Retrieve similar chunks from ChromaDB
+            t0 = time.time()
+            chunks = query_similar(doc.chroma_collection_id, question_vec, n_results=5, doc=doc)
+            retrieval_ms = (time.time() - t0) * 1000
 
-        # Step 3: Generate answer (single LLM call)
-        t0 = time.time()
-        answer = generate_answer(question, chunks, history)
-        generation_ms = (time.time() - t0) * 1000
+            # Step 3: Generate answer (single LLM call)
+            t0 = time.time()
+            answer = generate_answer(question, chunks, history)
+            generation_ms = (time.time() - t0) * 1000
 
     except DocumentUnavailableError as unavail_err:
         logger.warning(f"Document unavailable for doc {doc.id}: {unavail_err}")
@@ -238,6 +250,49 @@ async def send_message_stream(
             status_code=409,
             detail="A response is already being generated for this chat session. Please wait.",
         )
+
+    # Lightweight local intent check BEFORE generating query embedding
+    chitchat = get_chitchat_response(question)
+    if chitchat:
+        logger.info(f"[CHAT-STREAM] session_id={session.id} intent=chitchat")
+
+        async def chitchat_stream_generator():
+            _active_generating_sessions.add(session.id)
+            t_total = time.time()
+            try:
+                yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
+
+                words = chitchat.split(" ")
+                for i, word in enumerate(words):
+                    if await request.is_disconnected():
+                        logger.info(f"[CHAT-STREAM] Client disconnected session_id={session.id}")
+                        return
+                    chunk = word + (" " if i < len(words) - 1 else "")
+                    yield f"data: {json.dumps({'type': 'content', 'content': chunk})}\n\n"
+
+                t_db = time.time()
+                try:
+                    user_msg = Message(session_id=session.id, role="user", content=question)
+                    ai_msg = Message(session_id=session.id, role="assistant", content=chitchat, sources=json.dumps([]))
+                    db.add(user_msg)
+                    db.add(ai_msg)
+                    db.commit()
+                except Exception as db_exc:
+                    logger.error(f"Database error saving streaming chitchat: {db_exc}", exc_info=True)
+                    db.rollback()
+                db_ms = (time.time() - t_db) * 1000
+
+                total_ms = (time.time() - t_total) * 1000
+                logger.info(
+                    f"[CHAT-STREAM] session_id={session.id} user_id={current_user.id} "
+                    f"intent=chitchat db_save={db_ms:.0f}ms total={total_ms:.0f}ms"
+                )
+
+                yield 'data: {"type": "done"}\n\n'
+            finally:
+                _active_generating_sessions.discard(session.id)
+
+        return StreamingResponse(chitchat_stream_generator(), media_type="text/event-stream")
 
     # Pre-generation steps: embed query + retrieve chunks (before entering SSE generator)
     try:

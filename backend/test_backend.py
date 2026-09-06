@@ -86,6 +86,22 @@ def _get_auth_headers(client):
     return {"Authorization": f"Bearer {token}"}
 
 
+def _get_or_create_doc(client, headers):
+    """Helper to ensure at least one document exists and return its id."""
+    doc_res = client.get("/api/documents/", headers=headers)
+    docs = doc_res.json().get("data", [])
+    if docs:
+        return docs[0]["id"]
+    with patch("routers.document_router.parse_pdf") as mock_p, \
+         patch("routers.document_router.embed_texts") as mock_e, \
+         patch("routers.document_router.create_collection"), \
+         patch("routers.document_router.add_chunks"):
+        mock_p.return_value = [{"text": "Doc text", "page": 1}]
+        mock_e.return_value = [[0.1] * 3072]
+        res = client.post("/api/documents/upload", files={"file": ("test.pdf", b"%PDF-1.4 test", "application/pdf")}, headers=headers)
+        return res.json()["data"]["id"]
+
+
 def test_auth_register_and_login(client):
     # 1. Register
     reg_payload = {
@@ -396,3 +412,97 @@ def test_query_does_not_reindex_document(mock_query, mock_embed, client):
 
     # Clean up
     client.delete(f"/api/chat/session/{session_id}", headers=headers)
+
+
+@patch("routers.chat_router.embed_texts")
+@patch("routers.chat_router.query_similar")
+@patch("routers.chat_router.generate_answer")
+def test_chitchat_does_not_call_gemini(mock_gen_answer, mock_query, mock_embed, client):
+    """Verify that 'hi', 'hello', 'thanks', 'bye' return locally without Gemini or ChromaDB."""
+    headers = _get_auth_headers(client)
+    doc_id = _get_or_create_doc(client, headers)
+    sess_res = client.post("/api/chat/session", json={"document_id": doc_id}, headers=headers)
+    session_id = sess_res.json()["data"]["id"]
+
+    for greeting in ["hi", "hello!", "hey", "good morning", "thanks", "thank you", "bye"]:
+        res = client.post("/api/chat/message", json={
+            "session_id": session_id,
+            "message": greeting
+        }, headers=headers)
+        assert res.status_code == 200
+        assert res.json()["success"] is True
+        assert len(res.json()["data"]["sources"]) == 0
+        assert len(res.json()["data"]["answer"]) > 0
+
+    # Assert ZERO Gemini embedding calls, ZERO ChromaDB queries, ZERO Gemini generation calls
+    assert mock_embed.call_count == 0
+    assert mock_query.call_count == 0
+    assert mock_gen_answer.call_count == 0
+
+    # Clean up
+    client.delete(f"/api/chat/session/{session_id}", headers=headers)
+
+
+@patch("routers.chat_router.embed_texts")
+@patch("routers.chat_router.query_similar")
+@patch("routers.chat_router.generate_answer_stream")
+def test_chitchat_streaming_does_not_call_gemini(mock_gen_stream, mock_query, mock_embed, client):
+    """Verify that streaming chitchat returns locally via SSE without calling Gemini."""
+    headers = _get_auth_headers(client)
+    doc_id = _get_or_create_doc(client, headers)
+    sess_res = client.post("/api/chat/session", json={"document_id": doc_id}, headers=headers)
+    session_id = sess_res.json()["data"]["id"]
+
+    res = client.post("/api/chat/message/stream", json={
+        "session_id": session_id,
+        "message": "hello"
+    }, headers=headers)
+    assert res.status_code == 200
+    assert '"type": "content"' in res.text
+    assert '"type": "done"' in res.text
+
+    assert mock_embed.call_count == 0
+    assert mock_query.call_count == 0
+    assert mock_gen_stream.call_count == 0
+
+    # Clean up
+    client.delete(f"/api/chat/session/{session_id}", headers=headers)
+
+
+@patch("routers.chat_router.embed_texts")
+@patch("routers.chat_router.query_similar")
+@patch("routers.chat_router.generate_answer")
+def test_substantive_questions_use_rag(mock_gen_answer, mock_query, mock_embed, client):
+    """Verify questions with document context ('hi, explain chapter 2', etc.) go through normal RAG."""
+    mock_embed.return_value = [[0.1] * 3072]
+    mock_query.return_value = [{"text": "Chapter 2 overview", "metadata": {"page": 2, "source": "manual.pdf"}}]
+    mock_gen_answer.return_value = "Chapter 2 covers advanced topics."
+
+    headers = _get_auth_headers(client)
+    doc_id = _get_or_create_doc(client, headers)
+    sess_res = client.post("/api/chat/session", json={"document_id": doc_id}, headers=headers)
+    session_id = sess_res.json()["data"]["id"]
+
+    test_queries = [
+        "hi, explain chapter 2",
+        "hello, what is this PDF about?",
+        "thanks, now explain the previous answer",
+        "What is discussed on page 1?"
+    ]
+
+    for q in test_queries:
+        res = client.post("/api/chat/message", json={
+            "session_id": session_id,
+            "message": q
+        }, headers=headers)
+        assert res.status_code == 200
+        assert res.json()["success"] is True
+
+    # Each query MUST have triggered embedding, retrieval, and generation
+    assert mock_embed.call_count == len(test_queries)
+    assert mock_query.call_count == len(test_queries)
+    assert mock_gen_answer.call_count == len(test_queries)
+
+    # Clean up
+    client.delete(f"/api/chat/session/{session_id}", headers=headers)
+
